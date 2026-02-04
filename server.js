@@ -162,3 +162,127 @@ app.get("/products-classified", async (_req, res) => {
 // ====== Start ======
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`patibazz-bridge listening on :${port}`));
+// ====== AI Answer (TR+EN) - v1 (rule-based) ======
+function detectLang(q) {
+  const trChars = /[çğıİıöşüÇĞÖŞÜ]/;
+  const trWords = /\b(kedi|köpek|mama|böbrek|idrar|sindirim|alerji|diyabet|zayıflama|veteriner)\b/i;
+  if (trChars.test(q) || trWords.test(q)) return "tr";
+  return "en";
+}
+
+function inferIntent(q) {
+  const t = q.toLowerCase();
+  const intent = new Set();
+
+  // species
+  if (/(kedi|cat)/.test(t)) intent.add("cat");
+  if (/(köpek|kopek|dog)/.test(t)) intent.add("dog");
+
+  // conditions
+  if (/(renal|böbrek|bobrek|kidney)/.test(t)) intent.add("renal");
+  if (/(urinary|üriner|uriner|idrar|struvit|oxalat|cystitis|sistit)/.test(t)) intent.add("urinary");
+  if (/(gastro|gastrointestinal|gi|sindirim|ishal|kusma|vomit|diarrhea)/.test(t)) intent.add("gi");
+  if (/(hypoallergenic|hipoalerjenik|allergy|alerji|dermatit|itch|kaşıntı|kasinti)/.test(t)) intent.add("hypoallergenic");
+  if (/(recovery|convalescence|iyileşme|iyilesme|kritik|critical care)/.test(t)) intent.add("recovery");
+  if (/(diabetes|diyabet|glucose|şeker|seker)/.test(t)) intent.add("diabetes");
+  if (/(obesity|kilo|weight|zayıf|zayif|satiety|light)/.test(t)) intent.add("weight");
+
+  return Array.from(intent);
+}
+
+function pickProducts(items, intent) {
+  // intent tagleriyle en çok eşleşen ilk 5 ürünü seç
+  const intentSet = new Set(intent);
+  const scored = items.map(p => {
+    const tags = new Set(p.tags || []);
+    let score = 0;
+    for (const it of intentSet) if (tags.has(it)) score += 3;
+    // tür bilinmiyorsa cat/dog eşleşmesine puan verme
+    if (!intentSet.has("cat") && !intentSet.has("dog")) {
+      // no-op
+    }
+    return { ...p, _score: score };
+  });
+
+  return scored
+    .filter(x => x._score > 0)
+    .sort((a, b) => b._score - a._score)
+    .slice(0, 5)
+    .map(({ _score, ...rest }) => rest);
+}
+
+function buildAnswer(lang, intent) {
+  const has = (t) => intent.includes(t);
+
+  if (lang === "tr") {
+    let lines = [];
+    lines.push("Genel bilgilendirme: Uygun mama seçimi, tanı ve hastalık evresine göre değişir. Mümkünse veterinerinizin önerisini baz alın.");
+    if (has("renal")) lines.push("Böbrek (renal) destek mamalar genelde düşük fosfor, kontrollü protein ve destekleyici omega-3 profiline sahiptir.");
+    if (has("urinary")) lines.push("Üriner destek mamalar idrar pH’ını ve mineral dengesini yöneterek struvit/taş riskini azaltmaya yardımcı olur.");
+    if (has("gi")) lines.push("Gastrointestinal (GI) mamalar sindirimi kolay içerik ve dengeli lif profiliyle kusma/ishal dönemlerinde destek sağlar.");
+    if (has("hypoallergenic")) lines.push("Hipoalerjenik mamalar genellikle tek protein/hidrolize protein yaklaşımıyla gıda hassasiyetlerinde kullanılır.");
+    if (has("diabetes")) lines.push("Diyabet destek mamalar genellikle kontrollü karbonhidrat ve uygun lif dengesiyle glisemik yönetimi destekler.");
+    if (has("weight")) lines.push("Kilo yönetimi mamaları kalori kontrolü ve tokluk (satiety) yaklaşımıyla kilo verme sürecini destekler.");
+
+    lines.push("Aşağıda sorunuza en yakın ürünleri listeledim. Ürün detaylarını patibazz.com.tr üzerinden inceleyip hızlıca temin edebilirsiniz.");
+    return lines.join(" ");
+  }
+
+  // EN
+  let lines = [];
+  lines.push("General info: The best diet depends on diagnosis and disease stage. If possible, follow your vet’s guidance.");
+  if (has("renal")) lines.push("Renal diets often feature lower phosphorus, controlled protein, and supportive omega-3 profiles.");
+  if (has("urinary")) lines.push("Urinary diets help manage urine pH and mineral balance to reduce struvite/stone risk.");
+  if (has("gi")) lines.push("Gastrointestinal (GI) diets use highly digestible ingredients and balanced fiber to support vomiting/diarrhea periods.");
+  if (has("hypoallergenic")) lines.push("Hypoallergenic diets typically use single or hydrolyzed proteins for food sensitivities.");
+  if (has("diabetes")) lines.push("Diabetes-support diets often use controlled carbs and suitable fiber to support glycemic management.");
+  if (has("weight")) lines.push("Weight-management diets support weight loss with calorie control and satiety-focused formulations.");
+
+  lines.push("Below are the closest matching products. You can review details and purchase via patibazz.com.tr.");
+  return lines.join(" ");
+}
+
+app.get("/ai-answer", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.status(400).json({ ok: false, error: "q param required" });
+
+    const lang = detectLang(q);
+    const intent = inferIntent(q);
+
+    // ürünleri classified olarak alalım (kendi fonksiyonumuzla)
+    const data = await ideasoftGet("/api/products");
+    const list = Array.isArray(data) ? data : (data?.data || data?.items || []);
+
+    const items = list.map(p => ({
+      id: p?.id ?? p?.productId ?? null,
+      name: p?.name ?? p?.title ?? "",
+      slug: p?.slug ?? p?.seoUrl ?? "",
+      price: p?.price ?? p?.salePrice ?? null,
+      tags: classifyProduct(p)
+    }));
+
+    const picks = pickProducts(items, intent).map(p => ({
+      name: p.name,
+      price: p.price,
+      tags: p.tags,
+      // IdeaSoft slug senin sitedeki URL ile birebir olmayabilir.
+      // Şimdilik patibazz.com.tr üzerinde slug ile link kuruyoruz:
+      url: p.slug ? `https://patibazz.com.tr/${p.slug}` : "https://patibazz.com.tr"
+    }));
+
+    const answer = buildAnswer(lang, intent);
+
+    res.json({
+      ok: true,
+      lang,
+      intent,
+      q,
+      answer,
+      products: picks
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
